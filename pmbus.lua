@@ -371,10 +371,17 @@ local pmbus_fan_config_registers = {
 
 local mt = { __index = _M }
 
-function _M.new(self, bus, addr)
+function _M.new(self, banknum, bus, addr, on_plug, on_unplug)
     local t = {
-        f = i2c:new(bus),
+        present = false,
+        number = banknum,
+        bus = bus,
         addr  = addr,
+        mfr_serial = nil,
+        mfr_model = nil,
+        mfr_id = nil,
+        mfr_loc = nil,
+        mfr_rev = nil,
         page  = -1,
         pages = 0, -- total number of pages
         format = {},
@@ -388,9 +395,14 @@ function _M.new(self, bus, addr)
         exponent = {}, -- linear mode: exponent for output voltages
         sensors = {}, -- pmbus_sensor *
 
-        attrs = {}
+        attrs = {},
+
+        -- callbacks
+        on_plug = on_plug,
+        on_unplug = on_unplug
     }
 
+    t.f = i2c:new(bus)
     if not t.f then return end
 
     local i
@@ -484,6 +496,12 @@ function _M.read_word_data(self, page, reg)
     return self:i2c_read_word_data(reg)
 end
 
+function _M.read_string_data(self, reg, to_read)
+    local nmsg, data, err = self.f:rdwr(self.addr, stpack('B', reg), to_read)
+    if err then return nil, err end
+    return stunpack('Bc0', data), err
+end
+
 function _M.clear_fault_page(self, page)
     return self:write_byte(page, _M.PMBUS_CLEAR_FAULTS)
 end
@@ -540,6 +558,12 @@ function _M.identify(self)
             end
         end
     end
+
+    self.mfr_id     = self:read_string_data(_M.PMBUS_MFR_ID, 32)
+    self.mfr_refv   = self:read_string_data(_M.PMBUS_MFR_REVISION, 32)
+    self.mfr_loc    = self:read_string_data(_M.PMBUS_MFR_LOCATION, 32)
+    self.mfr_model  = self:read_string_data(_M.PMBUS_MFR_MODEL, 32)
+    self.mfr_serial = self:read_string_data(_M.PMBUS_MFR_SERIAL, 32)
 
     self:pmbus_find_sensor_groups()
 end
@@ -678,11 +702,17 @@ end
 function _M.read_attributes(self)
     local i, attr
     -- TODO: record values' timestamps
+    local ret_attrs = {}
     for i, attr in ipairs(self.attrs) do
-        local v = self:read_word_data(attr.page, attr.reg)
+        local v, err = self:read_word_data(attr.page, attr.reg)
+        if err ~= nil then
+            self:unplugged()
+            return {}
+        end
         attr.value = self:pmbus_reg2data(v, attr)
-        print('READ '..attr.label..' = '..tostring(attr.value))
+        ret_attrs[attr.label] = attr.value
     end
+    return ret_attrs
 end
 
 --
@@ -693,6 +723,10 @@ function _M.pmbus_reg2data_linear(self, data, sensor)
     local exponent
     local mantissa
     local val
+
+    if data == nil then
+        return nil
+    end
 
     if sensor.class == classes.PSC_VOLTAGE_OUT then -- LINEAR16
         exponent = s16(self.exponent[self.page])
@@ -895,6 +929,43 @@ function _M.do_probe(self)
     local err = self:pmbus_init_common()
     if err ~= nil then return err end
     self:pmbus_find_attributes()
+    self.present = true
+    if self.on_plug then
+        self:on_plug()
+    end
+end
+
+function _M.ping(self)
+    local newpage, err = self:i2c_read_byte_data(_M.PMBUS_PAGE)
+    if err ~= nil then
+        return false
+    end
+
+    self:do_probe()
+    return true
+end
+
+function _M.unplugged(self)
+    if self.on_unplug then
+        self:on_unplug()
+    end
+    self.present = false
+    self.mfr_serial = nil
+    self.mfr_model = nil
+    self.mfr_id = nil
+    self.mfr_loc = nil
+    self.mfr_rev = nil
+    self.page  = -1
+    self.pages = 0
+    self.format = {}
+    self.vrm_version = nil
+    self.m = {}
+    self.b = {}
+    self.R = {}
+    self.func = {}
+    self.exponent = {}
+    self.sensors = {}
+    self.attrs = {}
 end
 
 return _M
